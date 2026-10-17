@@ -1,6 +1,10 @@
 # STM32F407VET6-Based-Intelligent-Vehicle
 
-一个基于 **STM32F407VET6** 主控芯片的 ROS 智能小车硬件开源方案，包含小车底板与核心板的 PCB 设计资料、原理图、Gerber 打板文件、BOM 清单以及 3D 效果图，方便进行硬件复现、学习和二次开发。
+<p align="center">
+  <img src="./Picture/底板顶层3D.png" alt="封面: 底板顶层3D" />
+</p>
+
+一个基于 **STM32F407VET6** 主控芯片的 ROS 智能小车硬件开源方案，包含小车底板与核心板的 PCB 设计资料、原理图、Gerber 打板文件、BOM 清单以及 3D 效果[...]
 
 > 本仓库当前主要提供硬件设计资料，暂未包含 STM32 固件程序、ROS 节点或上位机软件代码。
 
