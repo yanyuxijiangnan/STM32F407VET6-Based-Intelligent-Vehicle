@@ -1,0 +1,234 @@
+#include "line_follow.h"
+#include "ccd.h"
+#include "motor.h"
+
+/* ======================== 巡线参数（路测可改宏） ======================== */
+/* 图像中线目标像素：128 点 CCD 中心约 64 */
+#define LINE_CENTER_PIXEL        64.0f
+/* 巡线基础速度 0~100：保留用户当前调参 */
+#define LINE_BASE_SPEED          40.0f
+/* 左右差速限幅（普通 PID 模式）：保留用户当前调参 */
+#define LINE_WZ_LIMIT            50.0f
+
+/* |error|>=此值：进入单侧静止 pivot（近似原地转），建议 22~28 */
+#define LINE_PIVOT_ERR           25.0f
+/* pivot 时运动侧轮速度，对侧=0；建议 35~45 */
+#define LINE_PIVOT_SPEED         40.0f
+/* |error|>=此值但未达 PIVOT：降速差速（base*SOFT_SCALE），建议 12~18 */
+#define LINE_SOFT_ERR            14.0f
+#define LINE_SOFT_BASE_SCALE     0.6f
+
+/* 丢线短时搜索：仅在“强拐弯预判”时允许，默认丢线直接停车 */
+/* 武装阈值：|last_error|>=此值且 turn_sign 有效才允许搜索，建议 ~15 */
+#define LINE_SEARCH_ARM_ERR      15.0f
+/* 搜索最长帧数（主循环约 20ms/帧）：40~55 ≈ 0.8~1.1s，超时停车 */
+#define LINE_SEARCH_MAX_FRAMES   48U
+
+/* |error| 达此阈值时更新转弯预判符号（有线维护，供丢线武装） */
+#define LINE_PREDICT_ERR         10.0f
+
+PID line_steer_pid;
+
+volatile float line_error = 0.0f;
+volatile float line_wz = 0.0f;
+volatile uint16_t line_vL = 0;
+volatile uint16_t line_vR = 0;
+volatile uint8_t line_enabled = 1;
+
+/* 有线时维护；丢线时只读，不强行长时间盲扫 */
+static float s_last_error = 0.0f;
+static uint16_t s_lost_frames = 0U;
+static int8_t s_turn_sign = 0;    /* error>0 => +1：需左慢右快 / 右轮驱动 pivot */
+static int8_t s_search_sign = 0;  /* 丢线首帧锁定，搜索期间固定 */
+static uint8_t s_search_armed = 0U; /* 1=本段丢线允许短时 pivot 搜索 */
+
+static float clampf(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static float absf(float v)
+{
+  return (v < 0.0f) ? -v : v;
+}
+
+static int8_t signf_nonzero(float v)
+{
+  if (v > 0.0f) return 1;
+  if (v < 0.0f) return -1;
+  return 0;
+}
+
+void LineFollow_Init(void)
+{
+  /* 转向环：target=中线像素，反馈 CCD_Center，输出作左右差速 */
+  /* 保留用户当前调参：kp=0.9, ki=0, kd=0.04 */
+  PID_init(&line_steer_pid, 0.9f, 0.0f, 0.04f, 0.05f, 200.0f);
+  line_steer_pid.target = LINE_CENTER_PIXEL;
+  line_enabled = 1;
+  line_error = 0.0f;
+  line_wz = 0.0f;
+  line_vL = 0;
+  line_vR = 0;
+  s_last_error = 0.0f;
+  s_lost_frames = 0U;
+  s_turn_sign = 0;
+  s_search_sign = 0;
+  s_search_armed = 0U;
+  Motor_SetLR(0, 0);
+}
+
+void LineFollow_Update(void)
+{
+  float vL;
+  float vR;
+  float wz;
+  float abs_err;
+  float base;
+  int8_t err_sign;
+
+  if (line_enabled == 0U)
+  {
+    return;
+  }
+
+  if (CCD_LineValid != 0U)
+  {
+    /* ---------- A. 有线且 LineValid ---------- */
+    wz = PID_location(&line_steer_pid, (float)CCD_Center);
+    wz = clampf(wz, -LINE_WZ_LIMIT, LINE_WZ_LIMIT);
+    line_error = line_steer_pid.error;
+    abs_err = absf(line_error);
+    err_sign = signf_nonzero(line_error);
+
+    s_last_error = line_error;
+    s_lost_frames = 0U;
+    s_search_armed = 0U;
+    /* 找回线后清搜索锁，下次丢线重新判断 */
+    s_search_sign = 0;
+
+    /* 维护转弯预判：大误差时记下符号，供丢线武装 */
+    if (abs_err >= LINE_PREDICT_ERR)
+    {
+      if (err_sign != 0)
+      {
+        s_turn_sign = err_sign;
+      }
+    }
+
+    if (abs_err >= LINE_PIVOT_ERR)
+    {
+      /* 急弯/小环：单侧轮不动，另一侧转（差速到一侧≈0） */
+      /* error>0（线偏左 / 需左转？按现约定：error>0 => 左慢右快）*/
+      /* 若实车拐反：对调下面 vL/vR 赋值即可，勿改 Motor 极性 */
+      if (err_sign > 0)
+      {
+        vL = 0.0f;
+        vR = LINE_PIVOT_SPEED;
+        line_wz = LINE_PIVOT_SPEED;
+      }
+      else if (err_sign < 0)
+      {
+        vL = LINE_PIVOT_SPEED;
+        vR = 0.0f;
+        line_wz = -LINE_PIVOT_SPEED;
+      }
+      else
+      {
+        vL = LINE_BASE_SPEED;
+        vR = LINE_BASE_SPEED;
+        line_wz = 0.0f;
+      }
+      if (err_sign != 0)
+      {
+        s_turn_sign = err_sign;
+      }
+    }
+    else
+    {
+      /* 中等/小误差：普通 BASE±wz；大误差时自动降速 */
+      base = LINE_BASE_SPEED;
+      if (abs_err >= LINE_SOFT_ERR)
+      {
+        base = LINE_BASE_SPEED * LINE_SOFT_BASE_SCALE;
+      }
+      line_wz = wz;
+      vL = base - wz;
+      vR = base + wz;
+    }
+  }
+  else
+  {
+    /* ---------- B. 丢线：默认停车；仅强预判允许短时 pivot 搜索 ---------- */
+    line_steer_pid.integral = 0.0f;
+
+    if (s_lost_frames == 0U)
+    {
+      /* 首帧决定是否武装搜索 */
+      abs_err = absf(s_last_error);
+      if (abs_err >= LINE_PIVOT_ERR)
+      {
+        /* 丢线前已是大误差：允许 pivot 搜索 */
+        s_search_armed = 1U;
+        s_search_sign = (s_turn_sign != 0) ? s_turn_sign : signf_nonzero(s_last_error);
+      }
+      else if ((s_turn_sign != 0) && (abs_err >= LINE_SEARCH_ARM_ERR))
+      {
+        /* 已进入过强预判且误差不小：允许短时搜索 */
+        s_search_armed = 1U;
+        s_search_sign = s_turn_sign;
+      }
+      else
+      {
+        /* 弱丢线（直道噪点等）：直接停，不盲扫 */
+        s_search_armed = 0U;
+        s_search_sign = 0;
+      }
+    }
+
+    if (s_lost_frames < 0xFFFFU)
+    {
+      s_lost_frames++;
+    }
+
+    if ((s_search_armed == 0U) ||
+        (s_search_sign == 0) ||
+        (s_lost_frames > LINE_SEARCH_MAX_FRAMES))
+    {
+      /* 未武装 / 无方向 / 超时：停车 */
+      line_error = 0.0f;
+      line_wz = 0.0f;
+      vL = 0.0f;
+      vR = 0.0f;
+      if (s_lost_frames > LINE_SEARCH_MAX_FRAMES)
+      {
+        s_search_armed = 0U;
+      }
+    }
+    else
+    {
+      /* 短时 pivot 搜索：同侧 0、对侧 PIVOT_SPEED，方向用锁定的 search_sign */
+      line_error = s_last_error;
+      if (s_search_sign > 0)
+      {
+        vL = 0.0f;
+        vR = LINE_PIVOT_SPEED;
+        line_wz = LINE_PIVOT_SPEED;
+      }
+      else
+      {
+        vL = LINE_PIVOT_SPEED;
+        vR = 0.0f;
+        line_wz = -LINE_PIVOT_SPEED;
+      }
+    }
+  }
+
+  vL = clampf(vL, 0.0f, (float)MAX_SPEED);
+  vR = clampf(vR, 0.0f, (float)MAX_SPEED);
+  line_vL = (uint16_t)vL;
+  line_vR = (uint16_t)vR;
+  Motor_SetLR(line_vL, line_vR);
+}

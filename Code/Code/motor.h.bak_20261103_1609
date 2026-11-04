@@ -1,0 +1,28 @@
+#ifndef __MOTOR_H__
+#define __MOTOR_H__
+
+#include "bsp_system.h"
+#include "tim.h"
+
+#define MAX_SPEED 100
+#define MIN_SPEED 0
+
+typedef enum {
+  SLOW_DECAY,
+  FAST_DECAY
+} Decay_Mode;
+
+void Motor_Init(void);
+void Motor_SetDuty(char motor, uint16_t IN1, uint16_t IN2);
+void Motor_SetWheelSpeed(char motor, uint16_t speed);
+void Motor_SetLR(uint16_t vL, uint16_t vR);
+void Motor_forward(uint16_t speed);
+void Motor_backward(uint16_t speed);
+void Motor_brake(void);
+void Motor_Coast(void);
+void Motor_SetDecayMode(Decay_Mode mode);
+
+extern volatile uint16_t motor_cmd_L;
+extern volatile uint16_t motor_cmd_R;
+
+#endif

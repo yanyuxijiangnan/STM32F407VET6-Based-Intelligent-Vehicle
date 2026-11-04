@@ -1,0 +1,149 @@
+#include "motor.h"
+
+static Decay_Mode currentDecayMode = SLOW_DECAY;
+
+volatile uint16_t motor_cmd_L = 0;
+volatile uint16_t motor_cmd_R = 0;
+volatile uint16_t motor_cmd_back = 0;
+volatile uint8_t  motor_run_mode = MOTOR_MODE_FWD;
+
+void Motor_Init(void)
+{
+  HAL_TIM_PWM_Start(&htim10, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim11, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim9, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim9, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  motor_run_mode = MOTOR_MODE_FWD;
+  motor_cmd_L = 0;
+  motor_cmd_R = 0;
+  motor_cmd_back = 0;
+}
+
+void Motor_SetDuty(char motor, uint16_t IN1, uint16_t IN2)
+{
+  if (motor == 'A')
+  {
+    __HAL_TIM_SetCompare(&htim10, TIM_CHANNEL_1, IN1);
+    __HAL_TIM_SetCompare(&htim11, TIM_CHANNEL_1, IN2);
+  }
+  else if (motor == 'B')
+  {
+    __HAL_TIM_SetCompare(&htim9, TIM_CHANNEL_1, IN1);
+    __HAL_TIM_SetCompare(&htim9, TIM_CHANNEL_2, IN2);
+  }
+  else if (motor == 'C')
+  {
+    __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_1, IN1);
+    __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, IN2);
+  }
+  else if (motor == 'D')
+  {
+    __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_3, IN1);
+    __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_4, IN2);
+  }
+}
+
+void Motor_SetWheelSpeed(char motor, uint16_t speed)
+{
+  if (speed > MAX_SPEED)
+  {
+    speed = MAX_SPEED;
+  }
+
+  if (currentDecayMode == FAST_DECAY)
+  {
+    if (motor == 'A') Motor_SetDuty('A', 0, speed);
+    else if (motor == 'B') Motor_SetDuty('B', speed, 0);
+    else if (motor == 'C') Motor_SetDuty('C', 0, speed);
+    else if (motor == 'D') Motor_SetDuty('D', 0, speed);
+  }
+  else
+  {
+    if (motor == 'A') Motor_SetDuty('A', MAX_SPEED - speed, MAX_SPEED);
+    else if (motor == 'B') Motor_SetDuty('B', MAX_SPEED, MAX_SPEED - speed);
+    else if (motor == 'C') Motor_SetDuty('C', MAX_SPEED - speed, MAX_SPEED);
+    else if (motor == 'D') Motor_SetDuty('D', MAX_SPEED - speed, MAX_SPEED);
+  }
+}
+
+/* 按现有各轮 IN 极性写后退占空比（开环）；TIM7 后退模式也调用此函数 */
+void Motor_ApplyBackwardDuty(uint16_t speed)
+{
+  if (speed > MAX_SPEED)
+  {
+    speed = MAX_SPEED;
+  }
+
+  if (currentDecayMode == FAST_DECAY)
+  {
+    Motor_SetDuty('A', speed, 0);
+    Motor_SetDuty('B', 0, speed);
+    Motor_SetDuty('C', speed, 0);
+    Motor_SetDuty('D', speed, 0);
+  }
+  else
+  {
+    Motor_SetDuty('A', MAX_SPEED, MAX_SPEED - speed);
+    Motor_SetDuty('B', MAX_SPEED - speed, MAX_SPEED);
+    Motor_SetDuty('C', MAX_SPEED, MAX_SPEED - speed);
+    Motor_SetDuty('D', MAX_SPEED, MAX_SPEED - speed);
+  }
+}
+
+/* 仅更新左右目标；切回正转模式；A/D 由速度环执行，B/C 在 TIM7 里开环跟随 */
+void Motor_SetLR(uint16_t vL, uint16_t vR)
+{
+  if (vL > MAX_SPEED) vL = MAX_SPEED;
+  if (vR > MAX_SPEED) vR = MAX_SPEED;
+  motor_run_mode = MOTOR_MODE_FWD;
+  motor_cmd_L = vL;
+  motor_cmd_R = vR;
+}
+
+void Motor_brake(void)
+{
+  motor_run_mode = MOTOR_MODE_FWD;
+  motor_cmd_back = 0;
+  Motor_SetDuty('A', 100, 100);
+  Motor_SetDuty('B', 100, 100);
+  Motor_SetDuty('C', 100, 100);
+  Motor_SetDuty('D', 100, 100);
+  motor_cmd_L = 0;
+  motor_cmd_R = 0;
+}
+
+void Motor_forward(uint16_t speed)
+{
+  Motor_SetLR(speed, speed);
+}
+
+void Motor_backward(uint16_t speed)
+{
+  if (speed > MAX_SPEED) speed = MAX_SPEED;
+  motor_run_mode = MOTOR_MODE_BACK;
+  motor_cmd_back = speed;
+  motor_cmd_L = 0;
+  motor_cmd_R = 0;
+  Motor_ApplyBackwardDuty(speed);
+}
+
+void Motor_Coast(void)
+{
+  motor_run_mode = MOTOR_MODE_FWD;
+  motor_cmd_back = 0;
+  Motor_SetDuty('A', 0, 0);
+  Motor_SetDuty('B', 0, 0);
+  Motor_SetDuty('C', 0, 0);
+  Motor_SetDuty('D', 0, 0);
+  motor_cmd_L = 0;
+  motor_cmd_R = 0;
+}
+
+void Motor_SetDecayMode(Decay_Mode mode)
+{
+  currentDecayMode = mode;
+}

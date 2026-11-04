@@ -1,0 +1,168 @@
+#include "line_follow.h"
+#include "ccd.h"
+#include "motor.h"
+
+/* 图像中线目标像素（128 点 CCD 中心） */
+#define LINE_CENTER_PIXEL   64.0f
+/* 巡线基础速度 0~100：保留用户当前调参 */
+#define LINE_BASE_SPEED     40.0f
+/* 丢线预判搜索时的前进速度（低于 BASE，避免冲出） */
+#define LINE_SEARCH_SPEED   30.0f
+/* 丢线搜索固定差速幅值（方向由 s_search_sign 锁定） */
+#define LINE_SEARCH_WZ      50.0f
+/* 左右差速限幅：保留用户当前调参 */
+#define LINE_WZ_LIMIT       50.0f
+/* |error| 达到该阈值且连续若干帧后，更新预判转弯符号 */
+#define LINE_PREDICT_ERR        10.0f
+#define LINE_PREDICT_HOLD_FRAMES 3U
+/* 连续丢线超过该帧数仍未找回则停车（主循环约 20ms/帧，约 1.4s） */
+#define LINE_SEARCH_MAX_FRAMES  70U
+
+PID line_steer_pid;
+
+volatile float line_error = 0.0f;
+volatile float line_wz = 0.0f;
+volatile uint16_t line_vL = 0;
+volatile uint16_t line_vR = 0;
+volatile uint8_t line_enabled = 1;
+
+/* 有线时维护的最后有效纠偏；丢线瞬间锁定搜索方向 */
+static float s_last_wz = 0.0f;
+static float s_last_error = 0.0f;
+static uint16_t s_lost_frames = 0U;
+static int8_t s_turn_sign = 0;       /* 有线预判：error>0 → +1 */
+static int8_t s_search_sign = 0;     /* 丢线首帧锁定，搜索全程固定 */
+static uint16_t s_predict_hold = 0U; /* |error|>=阈值的连续帧数 */
+
+static float clampf(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static int8_t signf_nonzero(float v)
+{
+  if (v > 0.0f) return 1;
+  if (v < 0.0f) return -1;
+  return 0;
+}
+
+void LineFollow_Init(void)
+{
+  /* 转向环：target=中线像素，反馈 CCD_Center，输出作左右差速 */
+  /* 保留用户当前调参：kp=0.9, ki=0, kd=0.04（勿改回 0.45/0.02） */
+  PID_init(&line_steer_pid, 0.9f, 0.0f, 0.04f, 0.05f, 200.0f);
+  line_steer_pid.target = LINE_CENTER_PIXEL;
+  line_enabled = 1;
+  s_last_wz = 0.0f;
+  s_last_error = 0.0f;
+  s_lost_frames = 0U;
+  s_turn_sign = 0;
+  s_search_sign = 0;
+  s_predict_hold = 0U;
+  Motor_SetLR(0, 0);
+}
+
+void LineFollow_Update(void)
+{
+  float vL;
+  float vR;
+  float wz;
+  float abs_err;
+
+  if (line_enabled == 0U)
+  {
+    return;
+  }
+
+  if (CCD_LineValid != 0U)
+  {
+    wz = PID_location(&line_steer_pid, (float)CCD_Center);
+    wz = clampf(wz, -LINE_WZ_LIMIT, LINE_WZ_LIMIT);
+    line_error = line_steer_pid.error;
+    line_wz = wz;
+
+    /* 记住有效纠偏，供丢线方向兜底 */
+    s_last_wz = wz;
+    s_last_error = line_error;
+    s_lost_frames = 0U;
+    s_search_sign = 0;
+
+    /* |error| 足够大且连续若干帧 → 更新预判转弯符号（以 error 为准） */
+    abs_err = line_error;
+    if (abs_err < 0.0f)
+    {
+      abs_err = -abs_err;
+    }
+    if (abs_err >= LINE_PREDICT_ERR)
+    {
+      if (s_predict_hold < 0xFFFFU)
+      {
+        s_predict_hold++;
+      }
+      if (s_predict_hold >= LINE_PREDICT_HOLD_FRAMES)
+      {
+        s_turn_sign = signf_nonzero(line_error);
+      }
+    }
+    else
+    {
+      s_predict_hold = 0U;
+    }
+
+    /* error=64-center>0 → 线偏左 → 左慢右快（wz>0 → vL小 vR大）视安装方向；
+       若实车拐反，把下面 vL/vR 对调即可 */
+    vL = LINE_BASE_SPEED - wz;
+    vR = LINE_BASE_SPEED + wz;
+  }
+  else
+  {
+    /* 丢线：首帧锁定搜索符号，全程固定幅值转弯，超时停车 */
+    line_steer_pid.integral = 0.0f;
+
+    if (s_lost_frames == 0U)
+    {
+      if (s_turn_sign != 0)
+      {
+        s_search_sign = s_turn_sign;
+      }
+      else
+      {
+        s_search_sign = signf_nonzero(s_last_error);
+        if (s_search_sign == 0)
+        {
+          s_search_sign = signf_nonzero(s_last_wz);
+        }
+      }
+    }
+
+    if (s_lost_frames < 0xFFFFU)
+    {
+      s_lost_frames++;
+    }
+
+    if ((s_search_sign == 0) || (s_lost_frames > LINE_SEARCH_MAX_FRAMES))
+    {
+      /* 无预判方向，或搜索超时：停车，避免盲转越偏越远 */
+      line_error = 0.0f;
+      line_wz = 0.0f;
+      vL = 0.0f;
+      vR = 0.0f;
+    }
+    else
+    {
+      wz = (float)s_search_sign * LINE_SEARCH_WZ;
+      line_error = s_last_error;
+      line_wz = wz;
+      vL = LINE_SEARCH_SPEED - wz;
+      vR = LINE_SEARCH_SPEED + wz;
+    }
+  }
+
+  vL = clampf(vL, 0.0f, (float)MAX_SPEED);
+  vR = clampf(vR, 0.0f, (float)MAX_SPEED);
+  line_vL = (uint16_t)vL;
+  line_vR = (uint16_t)vR;
+  Motor_SetLR(line_vL, line_vR);
+}

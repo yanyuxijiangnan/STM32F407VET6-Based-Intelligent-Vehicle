@@ -1,0 +1,17 @@
+#ifndef __LINE_FOLLOW_H__
+#define __LINE_FOLLOW_H__
+
+#include <stdint.h>
+#include "PID.h"
+
+void LineFollow_Init(void);
+void LineFollow_Update(void);
+
+extern PID line_steer_pid;
+extern volatile float line_error;
+extern volatile float line_wz;
+extern volatile uint16_t line_vL;
+extern volatile uint16_t line_vR;
+extern volatile uint8_t line_enabled;
+
+#endif

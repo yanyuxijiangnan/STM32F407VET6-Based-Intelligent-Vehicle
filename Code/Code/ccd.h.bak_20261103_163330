@@ -1,0 +1,34 @@
+#ifndef __CCD_H
+#define __CCD_H
+
+#include "main.h"
+#include "stm32f4xx_hal.h"
+
+/*
+ * TSL1401 on this board:
+ * SI  -> PC4 (CCD_SI_Pin in main.h)
+ * CLK -> PA5 (CCD_CLK_Pin in main.h)
+ * AO  -> PA4 / ADC1_IN4
+ */
+
+#define CCD_PIXEL_COUNT       128U
+
+/* 认线加强：对比度与线宽门槛（路测可改） */
+#define CCD_MIN_CONTRAST      80U
+#define CCD_MIN_WIDTH         8U
+#define CCD_MAX_WIDTH         45U
+
+extern volatile uint16_t CCD_Raw[CCD_PIXEL_COUNT];
+extern volatile uint16_t CCD_Min;
+extern volatile uint16_t CCD_Max;
+extern volatile uint16_t CCD_Threshold;
+extern volatile uint16_t CCD_Left;
+extern volatile uint16_t CCD_Right;
+extern volatile uint16_t CCD_Center;
+extern volatile uint8_t CCD_LineValid;
+
+void CCD_Init(void);
+HAL_StatusTypeDef CCD_ReadFrame(void);
+void CCD_ProcessFrame(void);
+
+#endif /* __CCD_H */
